@@ -1,0 +1,1156 @@
+---
+title: "Analytics in Practice Group Work"
+author: 'Group_Number_4'
+date: "2022-11-16"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data Dictionary
+
+Variable | Description
+------------- | -------------
+Customer_ID | Customer identification number
+recency | Months since last purhcase before the marketing campaign
+purchase_segment |Categorisation for the purhase amount in the past year before the marketing campaign<br>Categories:<br> 1) 0 - 100 : the purchase amount is between 0 and £100<br>2) 100 - 200: the purchase amount is between £100 and £200<br>3) 200 - 350; 4) 350 - 500; 5) 500 - 750 6) 750 - 1,000 7) 1,000
+purchase | Actual purchase in the past year before the marketing campaign
+mens | whether the customer purchased men's merchandise in the past year before the marketing campaign (1 = purchased, 0 = not)
+womens | whether the customer purchased women's merchandise in the past year before the marketing campaign (1= purchased, 0 = not)
+zip_area | categorisation of zip code as Urban, Suburban, or Rural
+new_customer | whether the customer is new in the past year or s/he is an existing customer (1 = new customer, 0 = existing customer)
+channel | categorisation of the channels the customer purchased from in the past year.<br>The categories are Phone, Web and Multichannel 
+email_segment | e-mail campaign the customer received<br>The categories are:<br>Mens E-mail: The customer received an email marketing campaign for men's products<br>Womens E-mail: The customer received an email marketing campaign for women's products<br>No E-mail: The customer did not receive an email
+age | age of the customer in years
+dependent | whether the customer has a dependent or not (1 = yes; 0 = no)
+account | whether the customer has an account or not (1 = yes; 0 = no)
+employed | whether the customer has a permenant job (1 = yes; 0 = no)
+phone | whether the customer registered his/her phone or not (1 = yes; 0 = no)
+delivery | categorisation for the delivery address (1 = home; 2 = work; 3 = multiple)
+marriage | marital status (1=married, 2=single, 0 = others)
+payment_card | whether the customer registered a credit card for payment in the past year (1 = yes; 0 = no)
+spend | total amount spent in the following two weeks period
+visit | 1: the customer visited the shop in the following two weeks period; <br>0: the customer did not visit the shop in the following two weeks period.
+
+```{r}
+# Install and load the necessary package and library
+
+library(mltools)
+
+library(data.table)
+
+library(docstring)
+
+library(car)
+
+library(tidyverse)
+
+library(caTools)
+
+library(caret) 
+
+library(pROC) 
+
+library(CustomerScoringMetrics)
+
+library(e1071)
+
+library(randomForest)
+
+library(party)
+
+library(MASS)
+
+library(ROSE)
+
+library(FSelector) 
+
+library(parallel)
+
+library(doParallel)
+
+cluster <- makeCluster(detectCores() - 13) # using multiple logical cores to increase training speed, complied on 3700x with 16 threads
+
+registerDoParallel(cluster)
+
+library(kernlab) 
+
+options(width=100)
+```
+
+
+```{r}
+# Load the data
+custdata <- read_csv("assignment_data.csv")
+summary(custdata)
+str(custdata)
+```
+
+
+```{r}
+# Data Cleaning
+
+# Remove Customer ID as this is not important in the analysis
+custdata$Customer_ID = NULL
+
+# Remove account variable as this only has 1 value
+custdata$account = NULL
+
+# Remove spending
+custdata$spend = NULL
+
+
+# Replace NA values in purchase segment with specified segment value based on the purchase value given in the purchase column
+
+custdata$purchase_segment[which(custdata$purchase < 100)] = "1) 0 - 100"
+custdata$purchase_segment[which(custdata$purchase > 100, custdata$purchase < 200)] = "2) 100 - 200"
+custdata$purchase_segment[which(custdata$purchase > 200, custdata$purchase < 350)] = "3) 200 - 350"
+custdata$purchase_segment[which(custdata$purchase > 350, custdata$purchase < 500)] = "4) 350 - 500"
+custdata$purchase_segment[which(custdata$purchase > 500, custdata$purchase < 750)] = "5) 500 - 750"
+custdata$purchase_segment[which(custdata$purchase > 750, custdata$purchase  < 1000)] = "6) 750 - 1,000"
+custdata$purchase_segment[which(custdata$purchase > 1000)] = "7) 1,000 +"
+
+
+# Change data type for certain variable to factor
+columns <- c("purchase_segment", "mens", "womens", "zip_area", "new_customer", "channel", "email_segment", "employed", "phone", "delivery", "marriage", "payment_card", "visit", "recency")
+custdata[columns] <- lapply(custdata[columns], factor)
+
+
+# Check cleaned data
+str(custdata)
+summary(custdata)
+
+# Check level of the target variable
+levels(custdata$visit)
+
+custdata <- na.omit(custdata)
+
+
+```
+
+
+```{r}
+#log normalization & boxplot to catch outliers
+#no outliers in our case
+custdata$age<-log(custdata$age)
+custdata$purchase<-log(custdata$purchase)
+boxplot(custdata$age)$out
+boxplot(custdata$purchase)$out
+
+```
+
+```{r}
+#applying one hot encoding to categorical data without order effect, i.e. channel & marriage
+#not applying to delivery since it might have level effect on visit
+#unable to apply to channel since it will introduces aliased coefficients and creates a rank-deficient fit for in logistic regression
+#custdata<-one_hot(as.data.table(custdata), cols = "channel")
+custdata<-one_hot(as.data.table(custdata), cols = "marriage")
+
+```
+
+
+# Splitting The Data
+
+```{r}
+# Set seed to 123
+set.seed(123)
+
+# Partition the data
+#using 0.7 since the data have 64000 rows and 30% would be enough for testing to avoid overfitting
+
+split = sample.split(custdata$visit, SplitRatio = 0.7) 
+
+trainingset = subset(custdata, split == TRUE) 
+testset = subset(custdata, split == FALSE) 
+
+```
+
+
+```{r}
+plot(trainingset$visit)
+
+#identified unbalance data, thus requires bothsampling
+#oversampling might introduce overfitting, while undersampling might introduce underfitting, thus bothsampling would be more balanced
+#using 0.4 to illustrate the imbalance to reflect reality to some degree
+
+bothsampled <- ovun.sample(visit ~., data = trainingset, method = "both", p=0.4, seed=123)$data
+
+#attempted using SMOTE to avoid bias and losing data, but the library is not available to the latest version of R
+#not applying SMOTE to avoid issues with other library
+
+# Apply SMOTE
+# library(performanceEstimation)
+# smoted <- smote(visit ~ ., trainingset, perc.over = 2000, perc.under = 400)
+
+# Checking the proportionality of the target variable in the bothsampled data
+table(bothsampled$visit)
+prop.table(table(bothsampled$visit))
+
+```
+
+```{r}
+#find information gain to understand importance level of each variables
+attribute_weights <- information.gain(visit~.,trainingset)
+attribute_weights$demo <- 0
+attribute_weights <- attribute_weights[order(attribute_weights$attr_importance,decreasing = T),]
+attribute_weights$demo <- NULL
+attribute_weights
+
+#since the importance for all varialbes are quite low, will keep all varialbes with +ve attribute importance
+
+#thus remove age, dependent, marriage with one hot encoding from the predictors
+
+#recency+email_segment+purchase+purchase_segment+channel_Multichannel+channel_Phone+channel_Web+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed
+
+# plotting information gain
+igchart<-attribute_weights
+
+igchart$attr <- rownames(attribute_weights)
+
+igchart <- arrange(igchart, -attr_importance)
+
+barplot(igchart$attr_importance, names = igchart$attr, las = 2, ylim = c(0, 0.06))
+
+```
+
+# Logistic Regression
+
+```{r}
+LogReg <- glm(visit ~ recency+email_segment+purchase+purchase_segment+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data = bothsampled, family = "binomial")
+
+# Predict the class probabilities of the test data
+LogReg_pred <- predict(LogReg, testset, type="response")
+
+
+# Predict the class 
+LOGREG_visit <- ifelse(LogReg_pred > 0.5, "1", "0")
+
+# Save the predictions as factor variables
+LOGREG_visit <- as.factor(LOGREG_visit)
+
+# Mode precision recall is choosen because we want to focus on the true positive rate
+confusionMatrix(LOGREG_visit, testset$visit, positive='1', mode = "prec_recall")
+```
+
+```{r}
+vif(LogReg,type = 'terms')
+#vif is higher than 10 for purchase and purchase_segment, suggesting high correlation
+#since purchase_segment is derived from purchase, and purchase has a higher importance, thus removing purchase_segment from predictors
+#mail_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed
+
+```
+
+```{r}
+#runnnig LogReg again with updated predictors
+LogReg_update <- glm(visit ~ recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data = bothsampled, family = "binomial")
+
+# Predict the class probabilities of the test data
+LogReg_pred <- predict(LogReg, testset, type="response")
+
+
+# Predict the class 
+LOGREG_visit <- ifelse(LogReg_pred > 0.5, "1", "0")
+
+# Save the predictions as factor variables
+LOGREG_visit <- as.factor(LOGREG_visit)
+
+# Mode precision recall is choosen because we want to focus on the true positive rate
+confusionMatrix(LOGREG_visit, testset$visit, positive='1', mode = "prec_recall")
+```
+
+```{r}
+vif(LogReg,type = 'terms')
+#all score lower than 5, thus removed multicollinearity from predictors
+```
+
+```{r}
+#since no hyperparameters available to LogReg, straight to repeated cross validation to avoid overfitting
+train_control <- trainControl(method = "repeatedcv", number = 2, repeats = 2)
+
+# train the model on training set
+LogReg_update_rcv <- train(visit ~ recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed,
+               data = bothsampled,
+               trControl = train_control,
+               method = "glm",
+               family=binomial())
+
+# print cv scores
+
+summary(LogReg_update_rcv)
+LogReg_pred_cv <- predict(LogReg_update_rcv, testset, type="prob")
+# Predict the class 
+LOGREG_visit_cv <- ifelse(LogReg_pred_cv[,2] > 0.5, "1", "0")
+
+# Save the predictions as factor variables
+LOGREG_visit_cv <- as.factor(as.character(LOGREG_visit_cv))
+
+# Mode precision recall is choosen because we want to focus on the true positive rate
+confusionMatrix(LOGREG_visit_cv, testset$visit, positive='1', mode = "prec_recall")
+```
+
+```{r}
+#removing insignificant predictors purchase & employed, keeping delivery since delivery2  is significant
+train_control <- trainControl(method = "repeatedcv", number = 2, repeats = 2)
+
+# train the model on training set
+LogReg_update_rcv2 <- train(visit ~ recency+email_segment+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area,
+               data = bothsampled,
+               trControl = train_control,
+               method = "glm",
+               family=binomial())
+
+# print cv scores
+
+summary(LogReg_update_rcv2)
+LogReg_pred_cv <- predict(LogReg_update_rcv2, testset, type="prob")
+# Predict the class 
+LOGREG_visit_cv <- ifelse(LogReg_pred_cv[,2] > 0.5, "1", "0")
+
+# Save the predictions as factor variables
+LOGREG_visit_cv <- as.factor(as.character(LOGREG_visit_cv))
+
+# Mode precision recall is choosen because we want to focus on the true positive rate
+confusionMatrix(LOGREG_visit_cv, testset$visit, positive='1', mode = "prec_recall")
+```
+
+# Support Vector Machine
+
+```{r}
+# Build SVM model and assign it to SVM_model
+#use radial since it is the general-purpose kernel, more fitting compare to linear (data is not linearly correlated), polynomial (used in image processing) and sigmoid (used as proxy for neural networks)
+
+#not using preProcess = "center", "scale" since data are already normalised
+
+
+SVM_model <- svm(visit ~ recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed , data = bothsampled, kernel= "radial",  probability = TRUE)
+
+
+# Predict the class of the test data
+SVM_pred <- predict(SVM_model, testset)
+
+
+# Use confusionMatrix to print the performance of SVM model
+confusionMatrix(SVM_pred, testset$visit, positive = '1', mode = "prec_recall")
+
+```
+
+
+
+
+```{r}
+#using caret package to find best model, tuning with hyperparameters cost and sigma
+grid_radial <- expand.grid(sigma = c(0.01,0.1,1),
+ C = c(0.1,1,10))
+
+trctrl <- trainControl(method = "repeatedcv", number = 2, repeats = 2)
+set.seed(3233)
+
+#not using preProcess = c("center", "scale") since data are already normalised
+#only using trControl for the best model due to extremely long run time
+
+svm_tune_3x3 <- train(visit ~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data = bothsampled, method = "svmRadial",
+#                trControl= trctrl,
+                tuneGrid = grid_radial,
+          allowParallel = T)
+```
+
+
+```{r}
+summary(svm_tune_3x3)
+# Predict the class of the test data
+svm_tune_3x3_tune <- predict(svm_tune_3x3, testset)
+
+
+# Use confusionMatrix to print the performance of SVM model
+confusionMatrix(svm_tune_3x3_tune, testset$visit, positive = '1', mode = "prec_recall")
+plot(svm_tune_3x3)
+#best tune is cost =10, sigma =1
+#the caret package can only tune model base on accuracy, thus unable to optimise base on other metric such as recall, precision
+```
+
+
+```{r}
+#manually attempted other combinations for tuning
+
+grid_radial <- expand.grid(sigma = c(0.1),
+ C = c(1))
+
+trctrl <- trainControl(method = "repeatedcv", number = 2, repeats = 2)
+set.seed(3233)
+
+svm_tune1 <- train(visit ~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data = bothsampled, method = "svmRadial",
+#                trControl= trctrl,
+                tuneGrid = grid_radial,
+          allowParallel = T)
+
+
+```
+
+
+```{r}
+summary(svm_tune)
+
+# Predict the class of the test data
+SVM_pred_tune <- predict(svm_tune1, testset)
+
+
+# Use confusionMatrix to print the performance of SVM model
+confusionMatrix(SVM_pred_tune, testset$visit, positive = '1', mode = "prec_recall")
+
+```
+
+
+```{r}
+grid_radial <- expand.grid(sigma = c(0.01),
+ C = c(0.1))
+
+trctrl <- trainControl(method = "repeatedcv", number = 2, repeats = 2)
+set.seed(3233)
+
+svm_tune2 <- train(visit ~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data = bothsampled, method = "svmRadial",
+#                trControl= trctrl,
+                tuneGrid = grid_radial,
+          allowParallel = T)
+
+
+```
+
+```{r}
+summary(svm_tune2)
+
+SVM_pred_tune2 <- predict(svm_tune2, testset)
+
+
+# Use confusionMatrix to print the performance of SVM model
+confusionMatrix(SVM_pred_tune2, testset$visit, positive = '1', mode = "prec_recall")
+```
+
+```{r}
+grid_radial <- expand.grid(sigma = c(1),
+ C = c(10))
+
+trctrl <- trainControl(method = "repeatedcv", number = 2, repeats = 2)
+set.seed(3233)
+
+svm_tune3 <- train(visit ~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data = bothsampled, method = "svmRadial",
+#                trControl= trctrl,
+                tuneGrid = grid_radial,
+          allowParallel = T)
+
+
+```
+
+```{r}
+
+summary(svm_tune3)
+
+# Predict the class of the test data
+SVM_pred_tune3 <- predict(svm_tune3, testset)
+
+
+# Use confusionMatrix to print the performance of SVM model
+confusionMatrix(SVM_pred_tune3, testset$visit, positive = '1', mode = "prec_recall")
+
+```
+
+
+
+```{r}
+#need to use classProbs = TRUE to generate probability, which requires the target variable to not be 0,1
+#thus changed to No and Yes
+#using classProbs = TRUE changes the model performance to inadequate (p value > 0.05, No information Rate > Accuracy)
+#therefore dropping the augment
+
+ bothsampled_svm <- bothsampled
+ bothsampled_svm <- bothsampled_svm %>%
+       mutate(visit = ifelse(visit == 0,"No","Yes"))
+
+bothsampled_svm$visit <- as.factor(bothsampled_svm$visit)
+
+grid_radial <- expand.grid(sigma = c(0.1),
+ C = c(1))
+
+trctrl <- trainControl(method = "repeatedcv", number = 2, repeats = 2)
+set.seed(123)
+
+svm_tune_rcv <- train(visit ~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data = bothsampled_svm, method = "svmRadial",
+                trControl= trctrl,
+                tuneGrid = grid_radial,
+          allowParallel = T)
+```
+
+```{r}
+
+# Predict the class of the test data
+SVM_pred_tune_rcv <- predict(svm_tune_rcv, testset)
+
+SVM_pred_tune_rcv <- as.factor(ifelse( SVM_pred_tune_rcv == "No","0","1"))
+
+
+# Use confusionMatrix to print the performance of SVM model
+confusionMatrix(SVM_pred_tune_rcv, testset$visit, positive = "1", mode = "prec_recall")
+
+```
+
+
+```{r}
+
+summary(svm_tune_rcv)
+```
+
+
+```{r}
+#using sigma automatically generated from the base model for tuning
+
+grid_radial <- expand.grid(sigma = c(0.03704704),
+ C = c(10))
+
+trctrl <- trainControl(method = "repeatedcv", number = 2, repeats = 2)
+set.seed(3233)
+
+svm_tune4 <- train(visit ~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data = bothsampled, method = "svmRadial",
+#                trControl= trctrl,
+                tuneGrid = grid_radial,
+          allowParallel = T)
+```
+
+```{r}
+SVM_pred_tune4 <- predict(svm_tune4, testset)
+
+
+# Use confusionMatrix to print the performance of SVM model
+confusionMatrix(SVM_pred_tune4, testset$visit, positive = '1', mode = "prec_recall")
+```
+
+```{r}
+grid_radial <- expand.grid(sigma = c(0.03704704),
+ C = c(0.1))
+
+trctrl <- trainControl(method = "repeatedcv", number = 2, repeats = 2)
+set.seed(3233)
+
+svm_tune5 <- train(visit ~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data = bothsampled, method = "svmRadial",
+#                trControl= trctrl,
+                tuneGrid = grid_radial,
+          allowParallel = T)
+```
+
+```{r}
+SVM_pred_tune5 <- predict(svm_tune5, testset)
+
+
+# Use confusionMatrix to print the performance of SVM model
+confusionMatrix(SVM_pred_tune5, testset$visit, positive = '1', mode = "prec_recall")
+```
+
+
+```{r}
+grid_radial <- expand.grid(sigma = c(0.03704704),
+ C = c(1))
+
+trctrl <- trainControl(method = "repeatedcv", number = 2, repeats = 2)
+set.seed(3233)
+
+svm_tune6 <- train(visit ~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data = bothsampled, method = "svmRadial",
+                trControl= trctrl,
+                tuneGrid = grid_radial,
+          allowParallel = T)
+
+SVM_pred_tune6 <- predict(svm_tune6, testset)
+
+
+# Use confusionMatrix to print the performance of SVM model
+confusionMatrix(SVM_pred_tune6, testset$visit, positive = '1', mode = "prec_recall")
+```
+
+
+# Decision Tree
+
+```{r}
+# Load package
+library(tree)
+library(rpart)
+
+
+
+# Build a decision tree 
+
+decTree  <- ctree(visit ~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data = bothsampled)
+
+decTreer <- rpart(visit ~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, 
+             method = "anova", data = bothsampled)
+
+
+#plot(decTree)
+#not ideal to represent the model
+
+Summary(decTree)
+
+decTree_predict = predict(decTree, testset, type= "response")
+
+
+# Confusion matrix
+confusionMatrix(decTree_predict, testset$visit, positive='1', mode = "prec_recall")
+```
+
+```{r}
+#attempted regression tree, but final predictions result makes little sense
+#1.6 is the lowest amount for p-value to be <0.05
+decTreer_predict = predict(decTreer, testset, type = "vector") >= 1.6
+
+decTreer_predict <- as.data.frame(decTreer_predict)
+
+
+decTreer_predict <- decTreer_predict %>%
+      mutate(decTreer_predict = ifelse(decTreer_predict == TRUE,"1","0"))
+
+decTreer_predict <- as.factor(decTreer_predict$decTreer_predict)
+
+
+# Confusion matrix
+confusionMatrix(decTreer_predict, testset$visit, positive='1', mode = "prec_recall")
+
+```
+
+
+
+
+```{r}
+#decision tree tuning
+ # Set the seed
+
+#.mincriterion is set base on 5%, trial and error on .maxdepth, minbucket = total rows of data in training set / 2^maxdepth, and take the average and closest odd number
+#decision tree is divided by 2 each layer, and odd number allows robust decision making
+
+ set.seed(123)
+
+trainCtrl <- trainControl(trim=TRUE,method="repeatedcv", number = 3, repeats = 2)
+
+tune <- expand.grid(.mincriterion = .95, 
+                    .maxdepth = as.integer(seq(5, 9, 2)))
+
+ctree_fit <- train(visit ~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data = bothsampled, 
+method = 'ctree2', trControl = trainCtrl, metric = "Accuracy", 
+tuneGrid = tune, controls = ctree_control(minbucket = 721))
+
+print(ctree_fit)
+Summary(ctree_fit)
+
+ctree_fit_predict = predict(ctree_fit, testset, type= "raw")
+
+
+# Confusion matrix
+confusionMatrix(ctree_fit_predict, testset$visit, positive='1', mode = "prec_recall")
+
+plot(ctree_fit)
+```
+
+```{r}
+trainCtrl <- trainControl(trim=TRUE,method="repeatedcv", number = 3, repeats = 2)
+
+tune <- expand.grid(.mincriterion = .95, 
+                    .maxdepth = as.integer(seq(10, 20, 5)))
+
+ctree_fit2 <- train(visit ~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data = bothsampled, 
+method = 'ctree2', trControl = trainCtrl, metric = "Accuracy", 
+tuneGrid = tune, controls = ctree_control(minbucket = 41))
+
+print(ctree_fit2)
+#Summary(ctree_fit)
+
+ctree_fit_predict2 = predict(ctree_fit2, testset, type= "raw")
+
+
+# Confusion matrix
+confusionMatrix(ctree_fit_predict2, testset$visit, positive='1', mode = "prec_recall")
+
+
+```
+
+
+```{r}
+trainCtrl <- trainControl(trim=TRUE,method="repeatedcv", number = 3, repeats = 2)
+
+tune <- expand.grid(.mincriterion = .95, 
+                    .maxdepth = as.integer(20))
+
+ctree_fit2 <- train(visit ~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data = bothsampled, 
+method = 'ctree2', trControl = trainCtrl, metric = "Accuracy", 
+tuneGrid = tune, controls = ctree_control(minbucket = 1))
+
+print(ctree_fit2)
+#Summary(ctree_fit)
+
+ctree_fit_predict2 = predict(ctree_fit2, testset, type= "raw")
+
+
+# Confusion matrix
+confusionMatrix(ctree_fit_predict2, testset$visit, positive='1', mode = "prec_recall")
+
+#plot(ctree_fit2)
+```
+
+```{r}
+#attempted to use classProbs = TRUE, but result in extremely high p-value
+#same situation happened to svm sigma=0.1, cost=1, with rcv 2 by 2
+#without classProbs, we are unable to predict the probability of visit under each email segment, thus the suggested decision is less precise
+
+set.seed(20)
+bothsampled_svm <- bothsampled
+bothsampled_svm <- bothsampled_svm %>%
+      mutate(visit = ifelse(visit == 0,"No","Yes"))
+trainCtrl <- trainControl(trim=TRUE,method="repeatedcv", number = 3, repeats = 2, classProbs = TRUE)
+
+tune <- expand.grid(.mincriterion = .95, 
+                    .maxdepth = as.integer(9))
+
+ctree_fit2 <- train(visit ~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data = bothsampled_svm, 
+method = 'ctree2', trControl = trainCtrl, metric = "Accuracy", 
+tuneGrid = tune, controls = ctree_control(minbucket = 87))
+
+print(ctree_fit2)
+#Summary(ctree_fit)
+
+ctree_fit_predict2 = predict(ctree_fit2, testset, type= "raw")
+ctree_fit_predict2 <- as.factor(ifelse( ctree_fit_predict2 == "No","0","1"))
+
+# Confusion matrix
+confusionMatrix(ctree_fit_predict2, testset$visit, positive='1', mode = "prec_recall")
+
+#again, similar to svm, applying classProbs = TRUE harms the model performance a lot
+```
+
+```{r}
+trainCtrl <- trainControl(trim=TRUE,method="repeatedcv", number = 3, repeats = 2)
+
+tune <- expand.grid(.mincriterion = .95, 
+                    .maxdepth = as.integer(10))
+
+ctree_fit3 <- train(visit ~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data = bothsampled, 
+method = 'ctree2', trControl = trainCtrl, metric = "Accuracy", 
+tuneGrid = tune, controls = ctree_control(minbucket = 43))
+
+print(ctree_fit3)
+#Summary(ctree_fit)
+
+ctree_fit_predict3 = predict(ctree_fit3, testset, type= "raw")
+
+
+# Confusion matrix
+confusionMatrix(ctree_fit_predict3, testset$visit, positive='1', mode = "prec_recall")
+
+#plot(ctree_fit2)
+```
+
+
+# Random Forest
+
+```{r}
+# Set random seed
+set.seed(123)
+
+# Build Random Forest model and assign it to RF_model
+RF_model <- randomForest(visit ~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, bothsampled)
+
+# Print
+print(RF_model)
+
+importance(RF_model)
+
+
+```
+
+
+
+```{r}
+# Predict the class of the test data
+RF_pred <- predict(RF_model, testset)
+
+# Confusion matrix
+confusionMatrix(RF_pred, testset$visit, positive='1', mode = "prec_recall")
+```
+
+
+# Random Forest Tuning
+
+```{r}
+randomForest::varImpPlot(RF_model)
+```
+
+
+```{r}
+
+# Grid Tuning for mtry: Number of variables randomly sampled as candidates at each split.
+set.seed(123)
+control <- trainControl(trim=TRUE,method="repeatedcv", number = 3, repeats = 2)
+tunegrid <- expand.grid(.mtry=c(4,8,12))
+rf_gridsearch <- train(visit~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data=bothsampled, method="rf", metric="Accuracy", trControl=control,
+    allowParallel = TRUE,
+    tuneGrid = tunegrid)
+print(rf_gridsearch)
+plot(rf_gridsearch)
+
+```
+
+```{r}
+# Manual tuning for ntree: Number of trees to grow.
+tunegrid2 <- expand.grid(.mtry=12)
+modellist <- list()
+for (ntree in c(1000, 1500, 2000, 2500)) {
+	set.seed(123)
+	fit <- train(visit~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data=bothsampled, method="rf", metric="Accuracy", tuneGrid=tunegrid2, trControl=control, ntree=ntree, allowParallel = TRUE)
+	key <- toString(ntree)
+	modellist[[key]] <- fit
+}
+# compare results
+results <- resamples(modellist)
+summary(results)
+dotplot(results)
+```
+
+```{r}
+# Set random seed
+set.seed(123)
+
+# Build Random Forest model and assign it to RF_model
+RF_model <- randomForest(visit ~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, bothsampled, ntree = 2500, mtry = 12)
+
+# Print
+print(RF_model)
+
+importance(RF_model)
+
+
+```
+
+```{r}
+set.seed(123)
+control <- trainControl(trim=TRUE,method="repeatedcv", number = 3, repeats = 2)
+tunegrid <- expand.grid(.mtry=12)
+rf_gridsearch_rcv <- train(visit~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data=bothsampled, method="rf", metric="Accuracy", trControl=control,ntree=2500,
+    allowParallel = TRUE,
+    tuneGrid = tunegrid)
+print(rf_gridsearch_rcv)
+#plot(rf_gridsearch_rcv)
+
+# Predict the class of the test data
+RF_pred_rcv <- predict(rf_gridsearch_rcv, testset)
+
+# Confusion matrix
+confusionMatrix(RF_pred_rcv, testset$visit, positive='1', mode = "prec_recall")
+```
+
+```{r}
+set.seed(123)
+control <- trainControl(trim=TRUE,method="repeatedcv", number = 3, repeats = 2)
+tunegrid <- expand.grid(.mtry=4)
+rf_gridsearch_rcv2 <- train(visit~recency+email_segment+purchase+channel+delivery+womens+new_customer+phone+payment_card+mens+zip_area+employed, data=bothsampled, method="rf", metric="Accuracy", trControl=control,ntree=1000,
+    allowParallel = TRUE,
+    tuneGrid = tunegrid)
+print(rf_gridsearch_rcv)
+
+# Predict the class of the test data
+RF_pred_rcv2 <- predict(rf_gridsearch_rcv2, testset)
+
+# Confusion matrix
+confusionMatrix(RF_pred_rcv2, testset$visit, positive='1', mode = "prec_recall")
+```
+
+
+
+```{r}
+# Obtain class probabilities by using predict() and adding type = "prob" for Random Forest
+RF_prob <- predict(RF_model, testset, type = "prob")  # Check the output for churn probabilties
+
+DT_prob <- predict(decTree, testset, type = "prob")
+
+SVM_pred <- predict(SVM_model, testset, probability = TRUE)
+
+# Add probability = TRUE for SVM
+SVM_prob <- attr(SVM_pred, "probabilities")  # Check the output for churn probabilties
+```
+
+
+```{r}
+# Logistic Regression
+ROC_LogReg <- roc(testset$visit, LogReg_pred)
+
+# Random Forest
+ROC_RF <- roc(testset$visit, RF_prob[,2])
+
+# Decision Tree
+DT_prob_df <- as.data.frame(t(matrix(unlist(DT_prob), ncol=19200)))
+ROC_DT <- roc(testset$visit, DT_prob_df[,2])
+
+
+# SVM
+ROC_SVM <- roc(testset$visit, SVM_prob[,2])
+```
+
+```{r}
+# Plot the ROC curve for Logistic Regression, SVM and Random Forest
+ggroc(list(LogReg = ROC_LogReg, SVM = ROC_SVM, DT = ROC_DT, RF = ROC_RF), legacy.axes=TRUE)+ xlab("FPR") + ylab("TPR") +
+   geom_abline(intercept = 0, slope = 1, color = "darkgrey", linetype = "dashed")
+```
+
+```{r}
+
+#Calculate the area under the curve (AUC) for Logistic Regression 
+auc(ROC_LogReg)
+
+#Calculate the area under the curve (AUC) for SVM 
+auc(ROC_SVM)
+
+auc(ROC_DT)
+
+#Calculate the area under the curve (AUC) for Random Forest 
+auc(ROC_RF)
+```
+
+```{r}
+# Obtain cumulative gains table for Logistic Regression
+GainTable_LogReg <- cumGainsTable(LogReg_pred, testset$visit, resolution = 1/100)
+
+# Obtain cumulative gains table for SVM
+GainTable_SVM <- cumGainsTable(SVM_prob[,2], testset$visit, resolution = 1/100)
+
+# Obtain cumulative gains table for Random Forest
+GainTable_RF <- cumGainsTable(RF_prob[,2], testset$visit, resolution = 1/100)
+
+# Obtain cumulative gains table for Decision Tree
+GainTable_DT <- cumGainsTable(DT_prob_df[,2], testset$visit, resolution = 1/100)
+
+
+plot(GainTable_LogReg[,4], col="red", type="l",    
+xlab="Percentage of test instances", ylab="Percentage of correct predictions")
+lines(GainTable_SVM[,4], col="green", type ="l")
+lines(GainTable_RF[,4], col="blue", type ="l")
+grid(NULL, lwd = 1)
+
+legend("bottomright",
+c("LogReg", "SVM", "Random Forest"),
+fill=c("red","blue", "green"))
+
+
+```
+
+```{r}
+# Predict the class of the test data
+SVM_pred_tune_rcv <- predict(svm_tune_rcv, testset)
+
+SVM_pred_tune_rcv <- as.factor(ifelse( SVM_pred_tune_rcv == "No","0","1"))
+
+
+# Use confusionMatrix to print the performance of SVM model
+confusionMatrix(SVM_pred_tune_rcv, testset$visit, positive = "1", mode = "prec_recall")
+
+# Predict the class of the test data
+SVM_pred_tune_rcv_test <- predict(svm_tune_rcv, trainingset)
+
+
+
+SVM_pred_tune_rcv_test <- as.factor(ifelse( SVM_pred_tune_rcv_test == "No","0","1"))
+
+
+# Use confusionMatrix to print the performance of SVM model
+confusionMatrix(SVM_pred_tune_rcv_test, trainingset$visit, positive = '1', mode = "prec_recall")
+```
+
+
+
+```{r}
+#function to generate client report for recommended email decision
+predict_visit_new_customer <- function(data){
+  #' Prediction Report
+  #'
+  #' Computes and return the recommended email segments to each new customer based on model prediction on visit
+  #' 
+  #' Input CSV file with new customer data and all columns except visit and spend 
+
+data$account = NULL
+
+    
+data$age <- as.numeric(data$age)
+data$dependent <- as.numeric(data$dependent)
+
+data$purchase<-log(data$purchase)
+data$age<-log(data$age)
+
+columnstest <- c("purchase_segment", "mens", "womens", "zip_area", "new_customer", "channel", "email_segment", "employed", "phone", "delivery", "marriage", "payment_card", "recency")
+data[columnstest] <- lapply(data[columnstest], factor)
+
+#data<-one_hot(as.data.table(data), cols = "marriage")
+#data %>% mutate(value = 1)  %>% spread(marriage, value,  fill = 0 )
+
+data_with_duplicate<-data %>%
+  mutate(rn = row_number()) %>%
+  rowwise() %>%
+  slice(rep(1, 3)) %>%
+  group_by(rn) %>%
+  mutate(email_segment = seq(from = 0, to = 2, length.out = n())) %>%
+  ungroup() %>%
+  dplyr::select(-rn)
+
+for (i in 1:length(data_with_duplicate$email_segment)){
+  if (data_with_duplicate$email_segment[i]==0){
+    data_with_duplicate$email_segment[i]<-"No E-Mail"
+  } else if (data_with_duplicate$email_segment[i]==1){
+    data_with_duplicate$email_segment[i]<-"Mens E-Mail"
+  } else if (data_with_duplicate$email_segment[i]==2){
+    data_with_duplicate$email_segment[i]<-"Womens E-Mail"
+  }
+}
+data_with_duplicate[columnstest] <- lapply(data_with_duplicate[columnstest], factor)
+
+data_with_duplicate2<-data_with_duplicate
+
+data_with_duplicate$Customer_ID<-NULL
+
+
+
+#then to model -> predict visit prob
+
+
+SVM_prob <- predict(svm_tune_rcv, data_with_duplicate)
+SVM_prob <- as.factor(ifelse( SVM_prob == "No","0","1"))
+
+
+data_with_duplicate2$visit <- SVM_prob
+
+extract <- data_with_duplicate2 %>% 
+    group_by(Customer_ID) %>%
+    dplyr::select(Customer_ID, email_segment, visit)
+
+result<-extract %>%
+  gather(key, value, visit) %>%group_by(Customer_ID)%>%
+  spread(email_segment, value)
+
+result <- result[,-2]
+
+for (i in 1:length(result$Customer_ID)){
+  if (result$`No E-Mail`[i]=="1"){
+    result$decision[i]<-"No E-Mail"
+  }else if(result$`Mens E-Mail`[i]=="1"){
+    result$decision[i]<-"Mens E-Mail"
+  }else if(result$`Womens E-Mail`[i]=="1"){
+    result$decision[i]<-"Womens E-Mail"
+  } else {result$decision[i]<-"No E-Mail"
+  }
+}
+
+for (i in 1:length(result$Customer_ID)){
+  if (result$`Mens E-Mail`[i]=="0" & result$`No E-Mail`[i]=="0" & result$`Womens E-Mail`[i]=="0"){
+    result$visit[i] = 0
+  }else{result$visit[i] = 1}
+}
+
+#previously attempted to use probability to generate suggestion action, but using the additional argument in caret tuning process makes the model obsolete
+
+# result$diff_men_no <- with(result, `Mens E-Mail` - `No E-Mail`)
+# result$diff_women_no <- with(result, `Womens E-Mail` - `No E-Mail`)
+# result$diff_men_women <- with(result, `Mens E-Mail` - `Womens E-Mail`)
+
+
+# for (i in 1:length(result$Customer_ID)){
+#   if (result$diff_men_no[i]<0 & result$diff_women_no[i]<0){
+#     result$decision[i]<-"No E-Mail"
+#   } else if (result$diff_men_women[i]>0) {
+#     result$decision[i]<-"Mens E-Mail"
+#   } else if (result$diff_men_women[i]<0) {
+#     result$decision[i]<-"Womens E-Mail"
+#   } else if (result$diff_men_women[i]==0){
+#     result$decision[i]<-"Indifferent to either email"
+#   }
+# }
+
+# for (i in 1:length(result$Customer_ID)){
+# result$probability_increase[i]<-max(result$diff_women_no[i],result$diff_men_no[i],0)
+# }
+
+for (i in 1:length(result$Customer_ID)){
+  if (result$decision[i]=="No E-Mail"){
+    result$send_email[i]=0
+  }else {result$send_email[i]=1
+  }
+}
+num_email<-sum(result$send_email)
+
+result<-result%>%dplyr::select(Customer_ID, decision, visit)
+
+
+#result<- result[order(result$probability_increase,decreasing = T),]
+
+print(result)
+}
+```
+
+```{r}
+?predict_visit_new_customer
+
+```
+
+```{r}
+#98
+set.seed(98)
+data_model<-testset[sample(nrow(testset), 100, replace = FALSE, prob = NULL),]
+data_model$visit <- as.numeric(as.character(data_model$visit))
+actual<-sum(data_model$visit)
+
+for (i in 1:length(data_model$age)){
+data_model$age[i]<-exp(1)^data_model$age[i]
+}
+
+for (i in 1:length(data_model$purchase)){
+data_model$purchase[i]<-exp(1)^data_model$purchase[i]
+}
+
+data_model<-as.data.frame(data_model)
+for (i in 1:length(data_model$marriage_0)){
+  if (data_model$marriage_0[i]==1){
+    data_model$marriage[i]<-0
+  }else if (data_model$marriage_1[i]==1){
+    data_model$marriage[i]<-1
+  }else if (data_model$marriage_2[i]==1){
+    data_model$marriage[i]<-2
+  }
+}
+data_model$marriage_0=NULL
+data_model$marriage_1=NULL
+data_model$marriage_2=NULL
+
+a=11064001
+
+for (i in 1:length(data_model$age)){
+  data_model$Customer_ID[i]=a
+  a<-a+1
+}
+
+data_model$account=1
+
+
+ans<-predict_visit_new_customer(data_model)
+
+data_model_original<-data_model
+
+data_model$email_segment<-as.character(data_model$email_segment)
+
+for (i in 1:length(ans$Customer_ID)){
+  for (j in 1:length(data_model$Customer_ID)){
+    if (data_model$Customer_ID[j]==ans$Customer_ID[i]){
+     data_model$email_segment[j]=ans$decision[i]
+    }
+  }
+}
+
+data_model$email_segment<-as.factor(data_model$email_segment)
+print(paste0("Expected number of customer visiting under best fitted model: ", sum(result$visit)))
+print(paste0("Actual number of customer visiting: ", actual))
+print(paste0("Number of E-mails needs to be sent under best fitted model ", num_email))
+
+
+
+```
+
+
